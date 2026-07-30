@@ -1,3 +1,15 @@
+/**
+ * @file symbol_table.c
+ * @brief Linear declaration table for ArrLang scalar and array variables.
+ *
+ * Responsibilities: store declared names, kinds, and array sizes; reject
+ * duplicate declarations; return borrowed lookup results; free stored names.
+ * This module does not emit C, parse grammar, or decide expression validity.
+ *
+ * Main dependencies: stdlib for storage and string.h for name comparisons.
+ * Typical flow: initialize before parsing, insert declarations as they are
+ * parsed, look up identifiers during semantic checks, free after compilation.
+ */
 #include "symbol_table.h"
 
 #include <stdlib.h>
@@ -19,6 +31,7 @@ static char *copy_string(const char *text)
     return copy;
 }
 
+/** Reset the table to a known empty state before a compilation starts. */
 void symbol_table_init(void)
 {
     symbols = NULL;
@@ -34,6 +47,9 @@ int symbol_table_insert(const char *name, SymbolKind kind, int array_size)
         return 0;
     }
 
+    /* The table is intentionally simple for the course project: a growable
+       linear array is enough for small programs and keeps lookup behavior easy
+       to explain. */
     if (symbol_count == symbol_capacity) {
         size_t new_capacity = symbol_capacity == 0 ? 8 : symbol_capacity * 2;
         grown_symbols = realloc(symbols, new_capacity * sizeof(*symbols));

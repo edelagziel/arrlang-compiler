@@ -1,3 +1,16 @@
+/**
+ * @file lexer.l
+ * @brief Flex lexer for ArrLang source code.
+ *
+ * Responsibilities: recognize keywords, identifiers, literals, punctuation,
+ * and operators; create Bison semantic token values; report lexical errors and
+ * increment the compiler lexical-error count. It does not perform semantic
+ * validation or generate C code.
+ *
+ * Main dependencies: parser.tab.h for token names and compiler_context for
+ * lexical error accounting. Typical flow: Bison calls yylex(), tokens are
+ * returned to parser.y, and invalid characters return LEXICAL_ERROR.
+ */
 %option noyywrap
 %option yylineno
 %option noinput
@@ -11,6 +24,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "compiler_context.h"
 #include "parser.tab.h"
 
 static char *copy_text(const char *text)
@@ -63,21 +77,19 @@ static int identifier_has_valid_tail(const char *text)
                                     return STRING_LITERAL;
                                 }
 \"([^\\\"\n]|\\.)*              {
-                                    extern int lexical_errors;
                                     fprintf(stderr, "Lexical error on line %d: unterminated string literal\n", yylineno);
-                                    lexical_errors++;
+                                    compiler_context_add_lexical_error();
                                     return LEXICAL_ERROR;
                                 }
 [a-zA-Z_][a-zA-Z0-9_]*         {
-                                    extern int lexical_errors;
                                     if (strlen(yytext) > 32) {
                                         fprintf(stderr, "Lexical error on line %d: identifier '%s' is longer than 32 characters\n", yylineno, yytext);
-                                        lexical_errors++;
+                                        compiler_context_add_lexical_error();
                                         return LEXICAL_ERROR;
                                     }
                                     if (!identifier_has_valid_tail(yytext)) {
                                         fprintf(stderr, "Lexical error on line %d: identifier '%s' contains a non-alphanumeric character after the first character\n", yylineno, yytext);
-                                        lexical_errors++;
+                                        compiler_context_add_lexical_error();
                                         return LEXICAL_ERROR;
                                     }
                                     yylval.str = copy_text(yytext);
@@ -110,14 +122,13 @@ static int identifier_has_valid_tail(const char *text)
 [ \t\r\n]+                      ;
 
 . {
-    extern int lexical_errors;
     fprintf(
         stderr,
         "Lexical error on line %d: unexpected character '%s'\n",
         yylineno,
         yytext
     );
-    lexical_errors++;
+    compiler_context_add_lexical_error();
     return LEXICAL_ERROR;
 }
 
