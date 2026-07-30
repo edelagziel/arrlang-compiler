@@ -3,6 +3,8 @@
 arrlangc
 output
 output.c
+*.exe
+*.out
 
 # Flex/Bison generated files
 lex.yy.c

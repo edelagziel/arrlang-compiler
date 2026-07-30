@@ -1,5 +1,7 @@
 %code requires {
 typedef struct Expression Expression;
+typedef struct StringBuffer StringBuffer;
+typedef struct StatementBlock StatementBlock;
 }
 
 %{
@@ -10,11 +12,16 @@ typedef struct Expression Expression;
 
 #include "symbol_table.h"
 
-typedef struct {
+typedef struct StringBuffer {
     char *data;
     size_t length;
     size_t capacity;
 } StringBuffer;
+
+typedef struct StatementBlock {
+    StringBuffer buffer;
+    StringBuffer *previous;
+} StatementBlock;
 
 typedef enum {
     EXPR_ERROR,
@@ -35,8 +42,11 @@ void yyerror(const char *message);
 extern FILE *yyin;
 extern int yylineno;
 
+int lexical_errors = 0;
+
 static StringBuffer declarations;
 static StringBuffer statements;
+static StringBuffer *active_statements = NULL;
 static const char *output_path = NULL;
 static int semantic_errors = 0;
 static int next_array_temp = 1;
@@ -56,11 +66,22 @@ static void expression_free(Expression *expression);
 static char *new_array_temp(int size);
 static char *new_scalar_temp(void);
 static char *new_loop_index(void);
+static void emit_setup(const StringBuffer *setup);
 static void declare_scalar(char *name);
 static void declare_array(char *name, int size);
 static void assign_expression(char *name, Expression *expression);
 static void reverse_array(char *name);
 static void sort_array(char *name);
+static void begin_print(char *label);
+static void print_separator(void);
+static void print_expression(Expression *expression);
+static void end_print(void);
+static void emit_expression_statement(Expression *expression);
+static StatementBlock *begin_statement_block(void);
+static StatementBlock *finish_statement_block(StatementBlock *block);
+static void statement_block_free(StatementBlock *block);
+static void emit_if_statement(Expression *condition, StatementBlock *then_block, StatementBlock *else_block);
+static void emit_loop_statement(Expression *count, StatementBlock *body);
 static Expression *make_number_expression(int value);
 static Expression *make_identifier_expression(char *name);
 static Expression *make_array_literal_expression(Expression *elements);
@@ -79,16 +100,26 @@ static int write_c_output(void);
     int num;
     char *str;
     Expression *expression;
+    StatementBlock *statement_block;
 }
 
 %token SCL
 %token ARR
+%token PRINT
+%token IF
+%token ELSE
+%token LOOP
+%token LEXICAL_ERROR
 %token <str> IDENTIFIER
+%token <str> STRING_LITERAL
 %token <num> NUMBER
 
 %type <expression> expression array_literal array_elements
+%type <num> array_element
+%type <statement_block> block_begin statement_block
 %destructor { free($$); } <str>
 %destructor { expression_free($$); } <expression>
+%destructor { statement_block_free($$); } <statement_block>
 
 %left ':'
 %left '+' '-'
@@ -109,6 +140,20 @@ block:
     '{' item_list '}'
 ;
 
+statement_block:
+    block_begin item_list '}'
+    {
+        $$ = finish_statement_block($1);
+    }
+;
+
+block_begin:
+    '{'
+    {
+        $$ = begin_statement_block();
+    }
+;
+
 item_list:
     /* empty */
     | item_list item
@@ -119,6 +164,10 @@ item:
     | assignment
     | reverse_statement
     | sort_statement
+    | print_statement
+    | if_statement
+    | loop_statement
+    | expression_statement
 ;
 
 declaration:
@@ -153,6 +202,54 @@ sort_statement:
     }
 ;
 
+print_statement:
+    PRINT STRING_LITERAL ':'
+    {
+        begin_print($2);
+    }
+    print_arguments ';'
+    {
+        end_print();
+    }
+;
+
+expression_statement:
+    expression ';'
+    {
+        emit_expression_statement($1);
+    }
+;
+
+print_arguments:
+    expression
+    {
+        print_expression($1);
+    }
+    | print_arguments ',' expression
+    {
+        print_separator();
+        print_expression($3);
+    }
+;
+
+if_statement:
+    IF expression statement_block
+    {
+        emit_if_statement($2, $3, NULL);
+    }
+    | IF expression statement_block ELSE statement_block
+    {
+        emit_if_statement($2, $3, $5);
+    }
+;
+
+loop_statement:
+    LOOP expression statement_block
+    {
+        emit_loop_statement($2, $3);
+    }
+;
+
 array_literal:
     '[' array_elements ']'
     {
@@ -161,13 +258,24 @@ array_literal:
 ;
 
 array_elements:
-    NUMBER
+    array_element
     {
         $$ = array_literal_start($1);
     }
-    | array_elements ',' NUMBER
+    | array_elements ',' array_element
     {
         $$ = array_literal_append($1, $3);
+    }
+;
+
+array_element:
+    NUMBER
+    {
+        $$ = $1;
+    }
+    | '-' NUMBER
+    {
+        $$ = -$2;
     }
 ;
 
@@ -401,6 +509,11 @@ static char *new_loop_index(void)
     return name;
 }
 
+static void emit_setup(const StringBuffer *setup)
+{
+    buffer_append_buffer(active_statements, setup);
+}
+
 static void declare_scalar(char *name)
 {
     int result = symbol_table_insert(name, SYMBOL_SCALAR, 0);
@@ -460,13 +573,13 @@ static void assign_expression(char *name, Expression *expression)
                 symbol->array_size
             );
         } else if (symbol->kind == SYMBOL_SCALAR) {
-            buffer_append_buffer(&statements, &expression->setup);
-            buffer_appendf(&statements, "    %s = %s;\n", name, expression->value);
+            emit_setup(&expression->setup);
+            buffer_appendf(active_statements, "    %s = %s;\n", name, expression->value);
         } else {
             index_name = new_loop_index();
-            buffer_append_buffer(&statements, &expression->setup);
+            emit_setup(&expression->setup);
             buffer_appendf(
-                &statements,
+                active_statements,
                 "    for (%s = 0; %s < %d; %s++) {\n"
                 "        %s[%s] = %s[%s];\n"
                 "    }\n",
@@ -501,7 +614,7 @@ static void reverse_array(char *name)
         index_name = new_loop_index();
         temp_name = new_scalar_temp();
         buffer_appendf(
-            &statements,
+            active_statements,
             "    for (%s = 0; %s < %d / 2; %s++) {\n"
             "        %s = %s[%s];\n"
             "        %s[%s] = %s[%d - 1 - %s];\n"
@@ -547,7 +660,7 @@ static void sort_array(char *name)
         j_name = new_loop_index();
         temp_name = new_scalar_temp();
         buffer_appendf(
-            &statements,
+            active_statements,
             "    for (%s = 0; %s < %d - 1; %s++) {\n"
             "        for (%s = 0; %s < %d - 1 - %s; %s++) {\n"
             "            if (%s[%s] > %s[%s + 1]) {\n"
@@ -587,6 +700,176 @@ static void sort_array(char *name)
     }
 
     free(name);
+}
+
+static void begin_print(char *label)
+{
+    if (strcmp(label, "\"\"") != 0) {
+        buffer_appendf(active_statements, "    printf(\"%%s: \", %s);\n", label);
+    }
+    free(label);
+}
+
+static void print_separator(void)
+{
+    buffer_appendf(active_statements, "    printf(\", \");\n");
+}
+
+static void print_expression(Expression *expression)
+{
+    char *index_name;
+
+    if (expression->kind == EXPR_ERROR) {
+        expression_free(expression);
+        return;
+    }
+
+    emit_setup(&expression->setup);
+
+    if (expression->kind == EXPR_SCALAR) {
+        buffer_appendf(active_statements, "    printf(\"%%d\", %s);\n", expression->value);
+    } else {
+        index_name = new_loop_index();
+        buffer_appendf(
+            active_statements,
+            "    printf(\"[\");\n"
+            "    for (%s = 0; %s < %d; %s++) {\n"
+            "        if (%s > 0) {\n"
+            "            printf(\", \");\n"
+            "        }\n"
+            "        printf(\"%%d\", %s[%s]);\n"
+            "    }\n"
+            "    printf(\"]\");\n",
+            index_name,
+            index_name,
+            expression->array_size,
+            index_name,
+            index_name,
+            expression->value,
+            index_name
+        );
+        free(index_name);
+    }
+
+    expression_free(expression);
+}
+
+static void end_print(void)
+{
+    buffer_appendf(active_statements, "    printf(\"\\n\");\n");
+}
+
+static void emit_expression_statement(Expression *expression)
+{
+    if (expression->kind != EXPR_ERROR) {
+        emit_setup(&expression->setup);
+        if (expression->kind == EXPR_SCALAR) {
+            buffer_appendf(active_statements, "    (void)(%s);\n", expression->value);
+        } else {
+            buffer_appendf(active_statements, "    (void)%s;\n", expression->value);
+        }
+    }
+
+    expression_free(expression);
+}
+
+static StatementBlock *begin_statement_block(void)
+{
+    StatementBlock *block = malloc(sizeof(*block));
+
+    if (block == NULL) {
+        fprintf(stderr, "Out of memory while creating statement block.\n");
+        exit(1);
+    }
+
+    buffer_init(&block->buffer);
+    block->previous = active_statements;
+    active_statements = &block->buffer;
+    return block;
+}
+
+static StatementBlock *finish_statement_block(StatementBlock *block)
+{
+    active_statements = block->previous;
+    block->previous = NULL;
+    return block;
+}
+
+static void statement_block_free(StatementBlock *block)
+{
+    if (block == NULL) {
+        return;
+    }
+
+    buffer_free(&block->buffer);
+    free(block);
+}
+
+static void emit_if_statement(Expression *condition, StatementBlock *then_block, StatementBlock *else_block)
+{
+    if (condition->kind == EXPR_ERROR) {
+        expression_free(condition);
+        statement_block_free(then_block);
+        statement_block_free(else_block);
+        return;
+    }
+
+    if (condition->kind != EXPR_SCALAR) {
+        report_semantic_error("if condition must be a scalar expression");
+    } else {
+        emit_setup(&condition->setup);
+        buffer_appendf(active_statements, "    if (%s) {\n", condition->value);
+        buffer_append_buffer(active_statements, &then_block->buffer);
+        buffer_appendf(active_statements, "    }");
+
+        if (else_block != NULL) {
+            buffer_appendf(active_statements, " else {\n");
+            buffer_append_buffer(active_statements, &else_block->buffer);
+            buffer_appendf(active_statements, "    }");
+        }
+
+        buffer_appendf(active_statements, "\n");
+    }
+
+    expression_free(condition);
+    statement_block_free(then_block);
+    statement_block_free(else_block);
+}
+
+static void emit_loop_statement(Expression *count, StatementBlock *body)
+{
+    char *index_name;
+    char *count_name;
+
+    if (count->kind == EXPR_ERROR) {
+        expression_free(count);
+        statement_block_free(body);
+        return;
+    }
+
+    if (count->kind != EXPR_SCALAR) {
+        report_semantic_error("loop count must be a scalar expression");
+    } else {
+        index_name = new_loop_index();
+        count_name = new_scalar_temp();
+        emit_setup(&count->setup);
+        buffer_appendf(active_statements, "    %s = %s;\n", count_name, count->value);
+        buffer_appendf(
+            active_statements,
+            "    for (%s = 0; %s < %s; %s++) {\n",
+            index_name,
+            index_name,
+            count_name,
+            index_name
+        );
+        buffer_append_buffer(active_statements, &body->buffer);
+        buffer_appendf(active_statements, "    }\n");
+        free(index_name);
+        free(count_name);
+    }
+
+    expression_free(count);
+    statement_block_free(body);
 }
 
 static Expression *make_number_expression(int value)
@@ -1041,11 +1324,12 @@ int main(int argc, char **argv)
     symbol_table_init();
     buffer_init(&declarations);
     buffer_init(&statements);
+    active_statements = &statements;
 
     parse_result = yyparse();
     fclose(input);
 
-    if (parse_result != 0 || semantic_errors > 0) {
+    if (parse_result != 0 || semantic_errors > 0 || lexical_errors > 0) {
         result = 1;
     } else {
         result = write_c_output();

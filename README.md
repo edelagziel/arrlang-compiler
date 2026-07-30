@@ -37,7 +37,7 @@ C compiler
 Executable program
 ```
 
-## Current Compiler Slice
+## Build And Run
 
 Build:
 
@@ -51,16 +51,37 @@ Compile an ArrLang file to C:
 ./arrlangc input.arr output.c
 ```
 
-This slice supports:
+Compile and run the generated C:
+
+```sh
+gcc -Wall -Wextra -std=c11 output.c -o output
+./output
+```
+
+Run the included sample:
+
+```sh
+mkdir -p build
+./arrlangc sample.arr build/sample.c
+gcc -Wall -Wextra -std=c11 build/sample.c -o build/sample
+./build/sample
+```
+
+## Supported Features
+
+ArrLang currently supports:
 
 - scalar declarations: `scl x;`
-- array declarations only: `arr nums{4};`
+- array declarations: `arr nums{4};`
 - array literal assignment: `nums = [1, 2, 3, 4];`
 - array operators: array/scalar arithmetic, array/array arithmetic, `#`, `!`, `:`, `~`, `$`
 - scalar assignments: `x = 5 + 3 * 2;`
 - scalar arithmetic with integer literals, scalar identifiers, `+`, `-`, `*`, `/`, parentheses, and unary minus
+- print statements: `print "Results": x, nums;`
+- if and if/else statements
+- loop statements with scalar loop counts
 
-Arrays cannot be printed or indexed on the left side of an assignment yet.
+Arrays cannot be indexed on the left side of an assignment.
 
 Clean generated files:
 
