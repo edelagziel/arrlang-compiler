@@ -5,66 +5,62 @@ A source-to-source compiler for the ArrLang programming language.
 The compiler accepts ArrLang source code and translates it into C, which can
 then be compiled into an executable program.
 
-The project is implemented using:
-
-- Flex / Lex for lexical analysis
-- Bison / YACC for parsing
-- C for semantic analysis and code generation
-- GCC for compiling the generated output
-
-## Project Goal
-
-The goal of this project is to build a compiler for ArrLang, a small language
-focused on scalar and array operations.
-
-The compilation pipeline is:
+## Project Layout
 
 ```text
-ArrLang source code
-        |
-Flex lexer
-        |
-Tokens
-        |
-Bison parser
-        |
-Semantic analysis
-        |
-Generated C code
-        |
-C compiler
-        |
-Executable program
+src/        C implementation modules
+include/    public module headers
+grammar/    Flex and Bison grammar sources
+examples/   example ArrLang programs
+tests/      valid, invalid, and runtime test programs
+build/      generated files, objects, binaries, and generated C output
 ```
+
+Generated Flex/Bison files are written to `build/generated/`, object files to
+`build/obj/`, the compiler executable to `build/bin/arrlangc`, and generated
+example/test output to `build/output/`.
 
 ## Build And Run
 
-Build:
+Build the compiler:
 
 ```sh
+make clean
 make
 ```
 
-Compile an ArrLang file to C:
+Run the sample program:
 
 ```sh
-./arrlangc input.arr output.c
+make run
 ```
 
-Compile and run the generated C:
+Run the test suite:
 
 ```sh
-gcc -Wall -Wextra -std=c11 output.c -o output
-./output
+make test
 ```
 
-Run the included sample:
+Manual pipeline:
 
 ```sh
-mkdir -p build
-./arrlangc sample.arr build/sample.c
-gcc -Wall -Wextra -std=c11 build/sample.c -o build/sample
-./build/sample
+mkdir -p build/output
+
+./build/bin/arrlangc \
+  examples/sample.arr \
+  build/output/sample.c
+
+gcc -Wall -Wextra -std=c11 \
+  build/output/sample.c \
+  -o build/output/sample
+
+./build/output/sample
+```
+
+Clean generated files:
+
+```sh
+make clean
 ```
 
 ## Supported Features
@@ -83,8 +79,14 @@ ArrLang currently supports:
 
 Arrays cannot be indexed on the left side of an assignment.
 
-Clean generated files:
+## Submission Locations
 
-```sh
-make clean
-```
+For the Moodle ZIP, use these organized paths:
+
+- lexer source: `grammar/lexer.l`
+- parser source: `grammar/parser.y`
+- Makefile: `Makefile`
+- compiler executable after build: `build/bin/arrlangc`
+- example ArrLang source: `examples/sample.arr`
+- generated C sample after `make sample`: `build/output/sample.c`
+- generated sample executable after `make sample`: `build/output/sample`

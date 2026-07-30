@@ -1,15 +1,24 @@
-# Build outputs
+# Build output
+build/
+
+# Legacy root build artifacts
 *.o
 arrlangc
-output
-output.c
-*.exe
-*.out
-
-# Flex/Bison generated files
 lex.yy.c
 parser.tab.c
 parser.tab.h
+output
+output.c
 
-# Build directory
-build/
+# Executables and temporary files
+*.exe
+*.out
+*.tmp
+*.log
+*~
+
+# Editor and OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
