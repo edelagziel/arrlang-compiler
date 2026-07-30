@@ -1,3 +1,7 @@
+%code requires {
+typedef struct ArrayLiteral ArrayLiteral;
+}
+
 %{
 #include <stdarg.h>
 #include <stdio.h>
@@ -11,6 +15,12 @@ typedef struct {
     size_t length;
     size_t capacity;
 } StringBuffer;
+
+typedef struct ArrayLiteral {
+    int *elements;
+    int count;
+    int capacity;
+} ArrayLiteral;
 
 int yylex(void);
 void yyerror(const char *message);
@@ -30,10 +40,14 @@ static char *copy_string(const char *text);
 static char *format_string(const char *format, ...);
 static char *make_binary_expression(char *left, const char *operator_text, char *right);
 static char *make_unary_expression(char *expression);
+static ArrayLiteral *array_literal_create(int first_element);
+static ArrayLiteral *array_literal_append(ArrayLiteral *literal, int element);
+static void array_literal_free(ArrayLiteral *literal);
 static void report_semantic_error(const char *format, ...);
 static void declare_scalar(char *name);
 static void declare_array(char *name, int size);
 static void assign_scalar(char *name, char *expression);
+static void assign_array_literal(char *name, ArrayLiteral *literal);
 static char *use_identifier(char *name);
 static int write_c_output(void);
 %}
@@ -41,6 +55,7 @@ static int write_c_output(void);
 %union {
     int num;
     char *str;
+    ArrayLiteral *array_literal;
 }
 
 %token SCL
@@ -49,6 +64,9 @@ static int write_c_output(void);
 %token <num> NUMBER
 
 %type <str> expression
+%type <array_literal> array_literal array_elements
+%destructor { free($$); } <str>
+%destructor { array_literal_free($$); } <array_literal>
 
 %left '+' '-'
 %left '*' '/'
@@ -91,6 +109,28 @@ assignment:
     IDENTIFIER '=' expression ';'
     {
         assign_scalar($1, $3);
+    }
+    | IDENTIFIER '=' array_literal ';'
+    {
+        assign_array_literal($1, $3);
+    }
+;
+
+array_literal:
+    '[' array_elements ']'
+    {
+        $$ = $2;
+    }
+;
+
+array_elements:
+    NUMBER
+    {
+        $$ = array_literal_create($1);
+    }
+    | array_elements ',' NUMBER
+    {
+        $$ = array_literal_append($1, $3);
     }
 ;
 
@@ -250,6 +290,63 @@ static char *make_unary_expression(char *expression)
     return result;
 }
 
+static ArrayLiteral *array_literal_create(int first_element)
+{
+    ArrayLiteral *literal = malloc(sizeof(*literal));
+
+    if (literal == NULL) {
+        fprintf(stderr, "Out of memory while creating array literal.\n");
+        exit(1);
+    }
+
+    literal->elements = malloc(4 * sizeof(*literal->elements));
+    if (literal->elements == NULL) {
+        free(literal);
+        fprintf(stderr, "Out of memory while creating array literal.\n");
+        exit(1);
+    }
+
+    literal->elements[0] = first_element;
+    literal->count = 1;
+    literal->capacity = 4;
+
+    return literal;
+}
+
+static ArrayLiteral *array_literal_append(ArrayLiteral *literal, int element)
+{
+    int *grown_elements;
+
+    if (literal->count == literal->capacity) {
+        int new_capacity = literal->capacity * 2;
+        grown_elements = realloc(literal->elements, (size_t)new_capacity * sizeof(*literal->elements));
+
+        if (grown_elements == NULL) {
+            array_literal_free(literal);
+            fprintf(stderr, "Out of memory while growing array literal.\n");
+            exit(1);
+        }
+
+        literal->elements = grown_elements;
+        literal->capacity = new_capacity;
+    }
+
+    literal->elements[literal->count] = element;
+    literal->count++;
+
+    return literal;
+}
+
+static void array_literal_free(ArrayLiteral *literal)
+{
+    if (literal == NULL) {
+        return;
+    }
+
+    free(literal->elements);
+    free(literal);
+}
+
 static void report_semantic_error(const char *format, ...)
 {
     va_list args;
@@ -317,6 +414,32 @@ static void assign_scalar(char *name, char *expression)
 
     free(name);
     free(expression);
+}
+
+static void assign_array_literal(char *name, ArrayLiteral *literal)
+{
+    Symbol *symbol = symbol_table_lookup(name);
+    int i;
+
+    if (symbol == NULL) {
+        report_semantic_error("assignment to undeclared variable '%s'", name);
+    } else if (symbol->kind == SYMBOL_SCALAR) {
+        report_semantic_error("cannot assign an array literal to scalar '%s'", name);
+    } else if (literal->count != symbol->array_size) {
+        report_semantic_error(
+            "array literal for '%s' has %d elements but declared size is %d",
+            name,
+            literal->count,
+            symbol->array_size
+        );
+    } else {
+        for (i = 0; i < literal->count; i++) {
+            buffer_appendf(&statements, "    %s[%d] = %d;\n", name, i, literal->elements[i]);
+        }
+    }
+
+    free(name);
+    array_literal_free(literal);
 }
 
 static char *use_identifier(char *name)
