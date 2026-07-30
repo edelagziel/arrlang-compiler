@@ -1,5 +1,5 @@
 %code requires {
-typedef struct ArrayLiteral ArrayLiteral;
+typedef struct Expression Expression;
 }
 
 %{
@@ -16,11 +16,18 @@ typedef struct {
     size_t capacity;
 } StringBuffer;
 
-typedef struct ArrayLiteral {
-    int *elements;
-    int count;
-    int capacity;
-} ArrayLiteral;
+typedef enum {
+    EXPR_ERROR,
+    EXPR_SCALAR,
+    EXPR_ARRAY
+} ExprKind;
+
+typedef struct Expression {
+    ExprKind kind;
+    int array_size;
+    char *value;
+    StringBuffer setup;
+} Expression;
 
 int yylex(void);
 void yyerror(const char *message);
@@ -32,30 +39,46 @@ static StringBuffer declarations;
 static StringBuffer statements;
 static const char *output_path = NULL;
 static int semantic_errors = 0;
+static int next_array_temp = 1;
+static int next_scalar_temp = 1;
+static int next_loop_index = 1;
 
 static void buffer_init(StringBuffer *buffer);
 static void buffer_free(StringBuffer *buffer);
 static void buffer_appendf(StringBuffer *buffer, const char *format, ...);
+static void buffer_append_buffer(StringBuffer *target, const StringBuffer *source);
 static char *copy_string(const char *text);
 static char *format_string(const char *format, ...);
-static char *make_binary_expression(char *left, const char *operator_text, char *right);
-static char *make_unary_expression(char *expression);
-static ArrayLiteral *array_literal_create(int first_element);
-static ArrayLiteral *array_literal_append(ArrayLiteral *literal, int element);
-static void array_literal_free(ArrayLiteral *literal);
 static void report_semantic_error(const char *format, ...);
+static Expression *expression_create(ExprKind kind, int array_size, const char *value);
+static Expression *expression_error(void);
+static void expression_free(Expression *expression);
+static char *new_array_temp(int size);
+static char *new_scalar_temp(void);
+static char *new_loop_index(void);
 static void declare_scalar(char *name);
 static void declare_array(char *name, int size);
-static void assign_scalar(char *name, char *expression);
-static void assign_array_literal(char *name, ArrayLiteral *literal);
-static char *use_identifier(char *name);
+static void assign_expression(char *name, Expression *expression);
+static void reverse_array(char *name);
+static void sort_array(char *name);
+static Expression *make_number_expression(int value);
+static Expression *make_identifier_expression(char *name);
+static Expression *make_array_literal_expression(Expression *elements);
+static Expression *array_literal_start(int element);
+static Expression *array_literal_append(Expression *literal, int element);
+static Expression *make_parenthesized_expression(Expression *expression);
+static Expression *make_unary_minus(Expression *expression);
+static Expression *make_array_size_expression(Expression *expression);
+static Expression *make_index_expression(Expression *array, Expression *index);
+static Expression *make_binary_expression(Expression *left, const char *operator_text, Expression *right);
+static Expression *make_concat_expression(Expression *left, Expression *right);
 static int write_c_output(void);
 %}
 
 %union {
     int num;
     char *str;
-    ArrayLiteral *array_literal;
+    Expression *expression;
 }
 
 %token SCL
@@ -63,13 +86,15 @@ static int write_c_output(void);
 %token <str> IDENTIFIER
 %token <num> NUMBER
 
-%type <str> expression
-%type <array_literal> array_literal array_elements
+%type <expression> expression array_literal array_elements
 %destructor { free($$); } <str>
-%destructor { array_literal_free($$); } <array_literal>
+%destructor { expression_free($$); } <expression>
 
+%left ':'
 %left '+' '-'
 %left '*' '/'
+%left '#'
+%right '!'
 %right UMINUS
 
 %start program
@@ -92,6 +117,8 @@ item_list:
 item:
     declaration
     | assignment
+    | reverse_statement
+    | sort_statement
 ;
 
 declaration:
@@ -108,25 +135,35 @@ declaration:
 assignment:
     IDENTIFIER '=' expression ';'
     {
-        assign_scalar($1, $3);
+        assign_expression($1, $3);
     }
-    | IDENTIFIER '=' array_literal ';'
+;
+
+reverse_statement:
+    '~' IDENTIFIER ';'
     {
-        assign_array_literal($1, $3);
+        reverse_array($2);
+    }
+;
+
+sort_statement:
+    '$' IDENTIFIER ';'
+    {
+        sort_array($2);
     }
 ;
 
 array_literal:
     '[' array_elements ']'
     {
-        $$ = $2;
+        $$ = make_array_literal_expression($2);
     }
 ;
 
 array_elements:
     NUMBER
     {
-        $$ = array_literal_create($1);
+        $$ = array_literal_start($1);
     }
     | array_elements ',' NUMBER
     {
@@ -137,20 +174,35 @@ array_elements:
 expression:
     NUMBER
     {
-        $$ = format_string("%d", $1);
+        $$ = make_number_expression($1);
     }
     | IDENTIFIER
     {
-        $$ = use_identifier($1);
+        $$ = make_identifier_expression($1);
+    }
+    | array_literal
+    {
+        $$ = $1;
     }
     | '(' expression ')'
     {
-        $$ = format_string("(%s)", $2);
-        free($2);
+        $$ = make_parenthesized_expression($2);
     }
     | '-' expression %prec UMINUS
     {
-        $$ = make_unary_expression($2);
+        $$ = make_unary_minus($2);
+    }
+    | '!' expression
+    {
+        $$ = make_array_size_expression($2);
+    }
+    | expression ':' expression
+    {
+        $$ = make_index_expression($1, $3);
+    }
+    | expression '#' expression
+    {
+        $$ = make_concat_expression($1, $3);
     }
     | expression '+' expression
     {
@@ -228,6 +280,13 @@ static void buffer_appendf(StringBuffer *buffer, const char *format, ...)
     buffer->length += (size_t)required;
 }
 
+static void buffer_append_buffer(StringBuffer *target, const StringBuffer *source)
+{
+    if (source->data != NULL) {
+        buffer_appendf(target, "%s", source->data);
+    }
+}
+
 static char *copy_string(const char *text)
 {
     size_t length = strlen(text) + 1;
@@ -271,82 +330,6 @@ static char *format_string(const char *format, ...)
     return result;
 }
 
-static char *make_binary_expression(char *left, const char *operator_text, char *right)
-{
-    char *result = format_string("(%s %s %s)", left, operator_text, right);
-
-    free(left);
-    free(right);
-
-    return result;
-}
-
-static char *make_unary_expression(char *expression)
-{
-    char *result = format_string("(-%s)", expression);
-
-    free(expression);
-
-    return result;
-}
-
-static ArrayLiteral *array_literal_create(int first_element)
-{
-    ArrayLiteral *literal = malloc(sizeof(*literal));
-
-    if (literal == NULL) {
-        fprintf(stderr, "Out of memory while creating array literal.\n");
-        exit(1);
-    }
-
-    literal->elements = malloc(4 * sizeof(*literal->elements));
-    if (literal->elements == NULL) {
-        free(literal);
-        fprintf(stderr, "Out of memory while creating array literal.\n");
-        exit(1);
-    }
-
-    literal->elements[0] = first_element;
-    literal->count = 1;
-    literal->capacity = 4;
-
-    return literal;
-}
-
-static ArrayLiteral *array_literal_append(ArrayLiteral *literal, int element)
-{
-    int *grown_elements;
-
-    if (literal->count == literal->capacity) {
-        int new_capacity = literal->capacity * 2;
-        grown_elements = realloc(literal->elements, (size_t)new_capacity * sizeof(*literal->elements));
-
-        if (grown_elements == NULL) {
-            array_literal_free(literal);
-            fprintf(stderr, "Out of memory while growing array literal.\n");
-            exit(1);
-        }
-
-        literal->elements = grown_elements;
-        literal->capacity = new_capacity;
-    }
-
-    literal->elements[literal->count] = element;
-    literal->count++;
-
-    return literal;
-}
-
-static void array_literal_free(ArrayLiteral *literal)
-{
-    if (literal == NULL) {
-        return;
-    }
-
-    free(literal->elements);
-    free(literal);
-}
-
 static void report_semantic_error(const char *format, ...)
 {
     va_list args;
@@ -359,6 +342,63 @@ static void report_semantic_error(const char *format, ...)
 
     fprintf(stderr, "\n");
     semantic_errors++;
+}
+
+static Expression *expression_create(ExprKind kind, int array_size, const char *value)
+{
+    Expression *expression = malloc(sizeof(*expression));
+
+    if (expression == NULL) {
+        fprintf(stderr, "Out of memory while creating expression.\n");
+        exit(1);
+    }
+
+    expression->kind = kind;
+    expression->array_size = array_size;
+    expression->value = copy_string(value);
+    buffer_init(&expression->setup);
+
+    return expression;
+}
+
+static Expression *expression_error(void)
+{
+    return expression_create(EXPR_ERROR, 0, "0");
+}
+
+static void expression_free(Expression *expression)
+{
+    if (expression == NULL) {
+        return;
+    }
+
+    free(expression->value);
+    buffer_free(&expression->setup);
+    free(expression);
+}
+
+static char *new_array_temp(int size)
+{
+    char *name = format_string("__arr_tmp_%d", next_array_temp++);
+
+    buffer_appendf(&declarations, "    int %s[%d];\n", name, size);
+    return name;
+}
+
+static char *new_scalar_temp(void)
+{
+    char *name = format_string("__scl_tmp_%d", next_scalar_temp++);
+
+    buffer_appendf(&declarations, "    int %s;\n", name);
+    return name;
+}
+
+static char *new_loop_index(void)
+{
+    char *name = format_string("__i_%d", next_loop_index++);
+
+    buffer_appendf(&declarations, "    int %s;\n", name);
+    return name;
 }
 
 static void declare_scalar(char *name)
@@ -400,60 +440,544 @@ static void declare_array(char *name, int size)
     free(name);
 }
 
-static void assign_scalar(char *name, char *expression)
+static void assign_expression(char *name, Expression *expression)
 {
     Symbol *symbol = symbol_table_lookup(name);
+    char *index_name;
 
     if (symbol == NULL) {
         report_semantic_error("assignment to undeclared variable '%s'", name);
-    } else if (symbol->kind == SYMBOL_ARRAY) {
-        report_semantic_error("cannot assign a scalar expression to array '%s'", name);
-    } else {
-        buffer_appendf(&statements, "    %s = %s;\n", name, expression);
-    }
-
-    free(name);
-    free(expression);
-}
-
-static void assign_array_literal(char *name, ArrayLiteral *literal)
-{
-    Symbol *symbol = symbol_table_lookup(name);
-    int i;
-
-    if (symbol == NULL) {
-        report_semantic_error("assignment to undeclared variable '%s'", name);
-    } else if (symbol->kind == SYMBOL_SCALAR) {
-        report_semantic_error("cannot assign an array literal to scalar '%s'", name);
-    } else if (literal->count != symbol->array_size) {
-        report_semantic_error(
-            "array literal for '%s' has %d elements but declared size is %d",
-            name,
-            literal->count,
-            symbol->array_size
-        );
-    } else {
-        for (i = 0; i < literal->count; i++) {
-            buffer_appendf(&statements, "    %s[%d] = %d;\n", name, i, literal->elements[i]);
+    } else if (expression->kind != EXPR_ERROR) {
+        if (symbol->kind == SYMBOL_SCALAR && expression->kind != EXPR_SCALAR) {
+            report_semantic_error("cannot assign an array expression to scalar '%s'", name);
+        } else if (symbol->kind == SYMBOL_ARRAY && expression->kind != EXPR_ARRAY) {
+            report_semantic_error("cannot assign a scalar expression to array '%s'", name);
+        } else if (symbol->kind == SYMBOL_ARRAY && expression->array_size != symbol->array_size) {
+            report_semantic_error(
+                "array expression for '%s' has size %d but declared size is %d",
+                name,
+                expression->array_size,
+                symbol->array_size
+            );
+        } else if (symbol->kind == SYMBOL_SCALAR) {
+            buffer_append_buffer(&statements, &expression->setup);
+            buffer_appendf(&statements, "    %s = %s;\n", name, expression->value);
+        } else {
+            index_name = new_loop_index();
+            buffer_append_buffer(&statements, &expression->setup);
+            buffer_appendf(
+                &statements,
+                "    for (%s = 0; %s < %d; %s++) {\n"
+                "        %s[%s] = %s[%s];\n"
+                "    }\n",
+                index_name,
+                index_name,
+                symbol->array_size,
+                index_name,
+                name,
+                index_name,
+                expression->value,
+                index_name
+            );
+            free(index_name);
         }
     }
 
     free(name);
-    array_literal_free(literal);
+    expression_free(expression);
 }
 
-static char *use_identifier(char *name)
+static void reverse_array(char *name)
 {
     Symbol *symbol = symbol_table_lookup(name);
-    char *result = copy_string(name);
+    char *index_name;
+    char *temp_name;
 
     if (symbol == NULL) {
-        report_semantic_error("use of undeclared variable '%s'", name);
-    } else if (symbol->kind == SYMBOL_ARRAY) {
-        report_semantic_error("array '%s' cannot be used as a scalar expression", name);
+        report_semantic_error("reverse of undeclared variable '%s'", name);
+    } else if (symbol->kind != SYMBOL_ARRAY) {
+        report_semantic_error("reverse operator requires array operand '%s'", name);
+    } else {
+        index_name = new_loop_index();
+        temp_name = new_scalar_temp();
+        buffer_appendf(
+            &statements,
+            "    for (%s = 0; %s < %d / 2; %s++) {\n"
+            "        %s = %s[%s];\n"
+            "        %s[%s] = %s[%d - 1 - %s];\n"
+            "        %s[%d - 1 - %s] = %s;\n"
+            "    }\n",
+            index_name,
+            index_name,
+            symbol->array_size,
+            index_name,
+            temp_name,
+            name,
+            index_name,
+            name,
+            index_name,
+            name,
+            symbol->array_size,
+            index_name,
+            name,
+            symbol->array_size,
+            index_name,
+            temp_name
+        );
+        free(index_name);
+        free(temp_name);
     }
 
     free(name);
+}
+
+static void sort_array(char *name)
+{
+    Symbol *symbol = symbol_table_lookup(name);
+    char *i_name;
+    char *j_name;
+    char *temp_name;
+
+    if (symbol == NULL) {
+        report_semantic_error("sort of undeclared variable '%s'", name);
+    } else if (symbol->kind != SYMBOL_ARRAY) {
+        report_semantic_error("sort operator requires array operand '%s'", name);
+    } else {
+        i_name = new_loop_index();
+        j_name = new_loop_index();
+        temp_name = new_scalar_temp();
+        buffer_appendf(
+            &statements,
+            "    for (%s = 0; %s < %d - 1; %s++) {\n"
+            "        for (%s = 0; %s < %d - 1 - %s; %s++) {\n"
+            "            if (%s[%s] > %s[%s + 1]) {\n"
+            "                %s = %s[%s];\n"
+            "                %s[%s] = %s[%s + 1];\n"
+            "                %s[%s + 1] = %s;\n"
+            "            }\n"
+            "        }\n"
+            "    }\n",
+            i_name,
+            i_name,
+            symbol->array_size,
+            i_name,
+            j_name,
+            j_name,
+            symbol->array_size,
+            i_name,
+            j_name,
+            name,
+            j_name,
+            name,
+            j_name,
+            temp_name,
+            name,
+            j_name,
+            name,
+            j_name,
+            name,
+            j_name,
+            name,
+            j_name,
+            temp_name
+        );
+        free(i_name);
+        free(j_name);
+        free(temp_name);
+    }
+
+    free(name);
+}
+
+static Expression *make_number_expression(int value)
+{
+    char *text = format_string("%d", value);
+    Expression *expression = expression_create(EXPR_SCALAR, 0, text);
+
+    free(text);
+    return expression;
+}
+
+static Expression *make_identifier_expression(char *name)
+{
+    Symbol *symbol = symbol_table_lookup(name);
+    Expression *expression;
+
+    if (symbol == NULL) {
+        report_semantic_error("use of undeclared variable '%s'", name);
+        expression = expression_error();
+    } else if (symbol->kind == SYMBOL_SCALAR) {
+        expression = expression_create(EXPR_SCALAR, 0, name);
+    } else {
+        expression = expression_create(EXPR_ARRAY, symbol->array_size, name);
+    }
+
+    free(name);
+    return expression;
+}
+
+static Expression *make_array_literal_expression(Expression *elements)
+{
+    return elements;
+}
+
+static Expression *array_literal_start(int element)
+{
+    char *temp_name = new_array_temp(1);
+    Expression *literal = expression_create(EXPR_ARRAY, 1, temp_name);
+
+    buffer_appendf(&literal->setup, "    %s[0] = %d;\n", temp_name, element);
+    free(temp_name);
+    return literal;
+}
+
+static Expression *array_literal_append(Expression *literal, int element)
+{
+    char *old_name;
+    char *new_name;
+    char *index_name;
+    Expression *expanded;
+
+    if (literal->kind == EXPR_ERROR) {
+        return literal;
+    }
+
+    old_name = copy_string(literal->value);
+    new_name = new_array_temp(literal->array_size + 1);
+    index_name = new_loop_index();
+    expanded = expression_create(EXPR_ARRAY, literal->array_size + 1, new_name);
+    buffer_append_buffer(&expanded->setup, &literal->setup);
+    buffer_appendf(
+        &expanded->setup,
+        "    for (%s = 0; %s < %d; %s++) {\n"
+        "        %s[%s] = %s[%s];\n"
+        "    }\n"
+        "    %s[%d] = %d;\n",
+        index_name,
+        index_name,
+        literal->array_size,
+        index_name,
+        new_name,
+        index_name,
+        old_name,
+        index_name,
+        new_name,
+        literal->array_size,
+        element
+    );
+
+    expression_free(literal);
+    free(old_name);
+    free(new_name);
+    free(index_name);
+    return expanded;
+}
+
+static Expression *make_parenthesized_expression(Expression *expression)
+{
+    char *value;
+    Expression *result;
+
+    if (expression->kind != EXPR_SCALAR) {
+        return expression;
+    }
+
+    value = format_string("(%s)", expression->value);
+    result = expression_create(EXPR_SCALAR, 0, value);
+    buffer_append_buffer(&result->setup, &expression->setup);
+    expression_free(expression);
+    free(value);
+    return result;
+}
+
+static Expression *make_unary_minus(Expression *expression)
+{
+    char *value;
+    Expression *result;
+
+    if (expression->kind == EXPR_ERROR) {
+        return expression;
+    }
+
+    if (expression->kind != EXPR_SCALAR) {
+        report_semantic_error("unary minus requires a scalar expression");
+        expression_free(expression);
+        return expression_error();
+    }
+
+    value = format_string("(-%s)", expression->value);
+    result = expression_create(EXPR_SCALAR, 0, value);
+    buffer_append_buffer(&result->setup, &expression->setup);
+    expression_free(expression);
+    free(value);
+    return result;
+}
+
+static Expression *make_array_size_expression(Expression *expression)
+{
+    char *value;
+    Expression *result;
+
+    if (expression->kind == EXPR_ERROR) {
+        return expression;
+    }
+
+    if (expression->kind != EXPR_ARRAY) {
+        report_semantic_error("size operator requires an array expression");
+        expression_free(expression);
+        return expression_error();
+    }
+
+    value = format_string("%d", expression->array_size);
+    result = expression_create(EXPR_SCALAR, 0, value);
+    buffer_append_buffer(&result->setup, &expression->setup);
+    expression_free(expression);
+    free(value);
+    return result;
+}
+
+static Expression *make_index_expression(Expression *array, Expression *index)
+{
+    char *temp_name;
+    Expression *result;
+
+    if (array->kind == EXPR_ERROR || index->kind == EXPR_ERROR) {
+        expression_free(array);
+        expression_free(index);
+        return expression_error();
+    }
+
+    if (array->kind != EXPR_ARRAY || index->kind != EXPR_SCALAR) {
+        report_semantic_error("index operator requires array on the left and scalar on the right");
+        expression_free(array);
+        expression_free(index);
+        return expression_error();
+    }
+
+    temp_name = new_scalar_temp();
+    result = expression_create(EXPR_SCALAR, 0, temp_name);
+    buffer_append_buffer(&result->setup, &array->setup);
+    buffer_append_buffer(&result->setup, &index->setup);
+    buffer_appendf(
+        &result->setup,
+        "    if (%s < 0 || %s >= %d) {\n"
+        "        fprintf(stderr, \"Runtime error: array index out of bounds\\n\");\n"
+        "        return 1;\n"
+        "    }\n"
+        "    %s = %s[%s];\n",
+        index->value,
+        index->value,
+        array->array_size,
+        temp_name,
+        array->value,
+        index->value
+    );
+
+    expression_free(array);
+    expression_free(index);
+    free(temp_name);
+    return result;
+}
+
+static Expression *make_binary_expression(Expression *left, const char *operator_text, Expression *right)
+{
+    Expression *result;
+    char *value;
+    char *temp_name;
+    char *index_name;
+
+    if (left->kind == EXPR_ERROR || right->kind == EXPR_ERROR) {
+        expression_free(left);
+        expression_free(right);
+        return expression_error();
+    }
+
+    if (left->kind == EXPR_SCALAR && right->kind == EXPR_SCALAR) {
+        if (strcmp(operator_text, "/") == 0) {
+            temp_name = new_scalar_temp();
+            result = expression_create(EXPR_SCALAR, 0, temp_name);
+            buffer_append_buffer(&result->setup, &left->setup);
+            buffer_append_buffer(&result->setup, &right->setup);
+            buffer_appendf(
+                &result->setup,
+                "    if (%s == 0) {\n"
+                "        fprintf(stderr, \"Runtime error: division by zero\\n\");\n"
+                "        return 1;\n"
+                "    }\n"
+                "    %s = %s / %s;\n",
+                right->value,
+                temp_name,
+                left->value,
+                right->value
+            );
+            free(temp_name);
+        } else {
+            value = format_string("(%s %s %s)", left->value, operator_text, right->value);
+            result = expression_create(EXPR_SCALAR, 0, value);
+            buffer_append_buffer(&result->setup, &left->setup);
+            buffer_append_buffer(&result->setup, &right->setup);
+            free(value);
+        }
+    } else if (left->kind == EXPR_ARRAY && right->kind == EXPR_ARRAY) {
+        if (left->array_size != right->array_size) {
+            report_semantic_error("array operands must have the same size");
+            expression_free(left);
+            expression_free(right);
+            return expression_error();
+        }
+
+        temp_name = new_array_temp(left->array_size);
+        index_name = new_loop_index();
+        result = expression_create(EXPR_ARRAY, left->array_size, temp_name);
+        buffer_append_buffer(&result->setup, &left->setup);
+        buffer_append_buffer(&result->setup, &right->setup);
+        if (strcmp(operator_text, "/") == 0) {
+            buffer_appendf(
+                &result->setup,
+                "    for (%s = 0; %s < %d; %s++) {\n"
+                "        if (%s[%s] == 0) {\n"
+                "            fprintf(stderr, \"Runtime error: division by zero\\n\");\n"
+                "            return 1;\n"
+                "        }\n"
+                "        %s[%s] = %s[%s] / %s[%s];\n"
+                "    }\n",
+                index_name,
+                index_name,
+                left->array_size,
+                index_name,
+                right->value,
+                index_name,
+                temp_name,
+                index_name,
+                left->value,
+                index_name,
+                right->value,
+                index_name
+            );
+        } else {
+            buffer_appendf(
+                &result->setup,
+                "    for (%s = 0; %s < %d; %s++) {\n"
+                "        %s[%s] = %s[%s] %s %s[%s];\n"
+                "    }\n",
+                index_name,
+                index_name,
+                left->array_size,
+                index_name,
+                temp_name,
+                index_name,
+                left->value,
+                index_name,
+                operator_text,
+                right->value,
+                index_name
+            );
+        }
+        free(temp_name);
+        free(index_name);
+    } else if (left->kind == EXPR_ARRAY && right->kind == EXPR_SCALAR) {
+        temp_name = new_array_temp(left->array_size);
+        index_name = new_loop_index();
+        result = expression_create(EXPR_ARRAY, left->array_size, temp_name);
+        buffer_append_buffer(&result->setup, &left->setup);
+        buffer_append_buffer(&result->setup, &right->setup);
+        if (strcmp(operator_text, "/") == 0) {
+            buffer_appendf(
+                &result->setup,
+                "    if (%s == 0) {\n"
+                "        fprintf(stderr, \"Runtime error: division by zero\\n\");\n"
+                "        return 1;\n"
+                "    }\n",
+                right->value
+            );
+        }
+        buffer_appendf(
+            &result->setup,
+            "    for (%s = 0; %s < %d; %s++) {\n"
+            "        %s[%s] = %s[%s] %s %s;\n"
+            "    }\n",
+            index_name,
+            index_name,
+            left->array_size,
+            index_name,
+            temp_name,
+            index_name,
+            left->value,
+            index_name,
+            operator_text,
+            right->value
+        );
+        free(temp_name);
+        free(index_name);
+    } else {
+        report_semantic_error("scalar-array arithmetic requires the array operand on the left");
+        expression_free(left);
+        expression_free(right);
+        return expression_error();
+    }
+
+    expression_free(left);
+    expression_free(right);
+    return result;
+}
+
+static Expression *make_concat_expression(Expression *left, Expression *right)
+{
+    Expression *result;
+    char *temp_name;
+    char *index_name;
+    int result_size;
+
+    if (left->kind == EXPR_ERROR || right->kind == EXPR_ERROR) {
+        expression_free(left);
+        expression_free(right);
+        return expression_error();
+    }
+
+    if (left->kind != EXPR_ARRAY || right->kind != EXPR_ARRAY) {
+        report_semantic_error("concatenation requires array operands");
+        expression_free(left);
+        expression_free(right);
+        return expression_error();
+    }
+
+    result_size = left->array_size + right->array_size;
+    temp_name = new_array_temp(result_size);
+    index_name = new_loop_index();
+    result = expression_create(EXPR_ARRAY, result_size, temp_name);
+    buffer_append_buffer(&result->setup, &left->setup);
+    buffer_append_buffer(&result->setup, &right->setup);
+    buffer_appendf(
+        &result->setup,
+        "    for (%s = 0; %s < %d; %s++) {\n"
+        "        %s[%s] = %s[%s];\n"
+        "    }\n"
+        "    for (%s = 0; %s < %d; %s++) {\n"
+        "        %s[%s + %d] = %s[%s];\n"
+        "    }\n",
+        index_name,
+        index_name,
+        left->array_size,
+        index_name,
+        temp_name,
+        index_name,
+        left->value,
+        index_name,
+        index_name,
+        index_name,
+        right->array_size,
+        index_name,
+        temp_name,
+        index_name,
+        left->array_size,
+        right->value,
+        index_name
+    );
+
+    expression_free(left);
+    expression_free(right);
+    free(temp_name);
+    free(index_name);
     return result;
 }
 

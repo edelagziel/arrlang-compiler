@@ -56,10 +56,11 @@ This slice supports:
 - scalar declarations: `scl x;`
 - array declarations only: `arr nums{4};`
 - array literal assignment: `nums = [1, 2, 3, 4];`
+- array operators: array/scalar arithmetic, array/array arithmetic, `#`, `!`, `:`, `~`, `$`
 - scalar assignments: `x = 5 + 3 * 2;`
 - scalar arithmetic with integer literals, scalar identifiers, `+`, `-`, `*`, `/`, parentheses, and unary minus
 
-Arrays cannot be used in scalar expressions yet.
+Arrays cannot be printed or indexed on the left side of an assignment yet.
 
 Clean generated files:
 

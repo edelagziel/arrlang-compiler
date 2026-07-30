@@ -57,6 +57,11 @@ static char *copy_text(const char *text)
 "-"                             return '-';
 "*"                             return '*';
 "/"                             return '/';
+"#"                             return '#';
+"!"                             return '!';
+"~"                             return '~';
+"$"                             return '$';
+":"                             return ':';
 
 [ \t\r\n]+                      ;
 
